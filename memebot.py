@@ -65,7 +65,7 @@ FILTROS = {
     "volumen_24h_minimo_usd": 5_000,    # actividad mínima reciente
     "edad_maxima_horas": 48,            # solo tokens lanzados hace menos de X horas
     "market_cap_maximo_usd": 10_000_000,# evita tokens que ya "explotaron" y subir es más difícil
-    "cambio_precio_5m_minimo_pct": 2,   # debe estar moviéndose, no plano
+    "cambio_precio_5m_minimo_pct": 2,   # solo sube (no baja): mínimo % de subida en 5 min
 }
 
 logging.basicConfig(
@@ -169,7 +169,7 @@ def cumple_filtros(par: dict) -> bool:
             return False
         if market_cap > FILTROS["market_cap_maximo_usd"]:
             return False
-        if abs(cambio_5m) < FILTROS["cambio_precio_5m_minimo_pct"]:
+        if cambio_5m < FILTROS["cambio_precio_5m_minimo_pct"]:
             return False
 
         return True
