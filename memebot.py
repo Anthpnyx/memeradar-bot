@@ -61,11 +61,11 @@ SEEN_TOKENS_FILE = "seen_tokens.json"
 # ──────────────────────────────────────────────────────────────────────────
 
 FILTROS = {
-    "liquidez_minima_usd": 10_000,      # ignora tokens con menos liquidez que esto
-    "volumen_24h_minimo_usd": 20_000,   # actividad mínima reciente
-    "edad_maxima_horas": 24,            # solo tokens lanzados hace menos de X horas
-    "market_cap_maximo_usd": 5_000_000, # evita tokens que ya "explotaron" y subir es más difícil
-    "cambio_precio_5m_minimo_pct": 5,   # debe estar moviéndose, no plano
+    "liquidez_minima_usd": 3_000,       # ignora tokens con menos liquidez que esto
+    "volumen_24h_minimo_usd": 5_000,    # actividad mínima reciente
+    "edad_maxima_horas": 48,            # solo tokens lanzados hace menos de X horas
+    "market_cap_maximo_usd": 10_000_000,# evita tokens que ya "explotaron" y subir es más difícil
+    "cambio_precio_5m_minimo_pct": 2,   # debe estar moviéndose, no plano
 }
 
 logging.basicConfig(
@@ -92,23 +92,57 @@ def guardar_tokens_vistos(vistos: set) -> None:
         json.dump(list(vistos), f)
 
 
-def obtener_tokens_nuevos_solana() -> list:
+def obtener_direcciones_tokens_nuevos() -> list:
     """
-    Consulta DexScreener por pares recientes en Solana.
-    Devuelve una lista de diccionarios con la info de cada par.
+    Consulta el endpoint de 'perfiles de token más recientes' de DexScreener.
+    Este endpoint sí refleja tokens que acaban de aparecer, a diferencia de
+    /search que devuelve siempre resultados similares para la misma consulta.
+    Devuelve una lista de direcciones de contrato en Solana.
     """
-    url = "https://api.dexscreener.com/latest/dex/search"
-    params = {"q": "solana"}
+    url = "https://api.dexscreener.com/token-profiles/latest/v1"
     try:
-        resp = requests.get(url, params=params, timeout=15)
+        resp = requests.get(url, timeout=15)
+        resp.raise_for_status()
+        perfiles = resp.json() or []
+        direcciones = [
+            p.get("tokenAddress")
+            for p in perfiles
+            if p.get("chainId") == "solana" and p.get("tokenAddress")
+        ]
+        return direcciones
+    except requests.RequestException as e:
+        log.warning(f"Error consultando perfiles nuevos de DexScreener: {e}")
+        return []
+
+
+def obtener_pares_de_token(direccion: str) -> list:
+    """
+    Dado un token address, trae sus pares de trading (liquidez, volumen, etc.)
+    """
+    url = f"https://api.dexscreener.com/latest/dex/tokens/{direccion}"
+    try:
+        resp = requests.get(url, timeout=15)
         resp.raise_for_status()
         data = resp.json()
-        pares = data.get("pairs", []) or []
-        # nos quedamos solo con pares de la chain solana
-        return [p for p in pares if p.get("chainId") == "solana"]
+        return data.get("pairs", []) or []
     except requests.RequestException as e:
-        log.warning(f"Error consultando DexScreener: {e}")
+        log.warning(f"Error consultando pares de {direccion}: {e}")
         return []
+
+
+def obtener_tokens_nuevos_solana() -> list:
+    """
+    Combina los pasos anteriores: obtiene tokens recién listados en Solana
+    y trae los datos completos de sus pares de trading.
+    """
+    direcciones = obtener_direcciones_tokens_nuevos()
+    todos_los_pares = []
+    for direccion in direcciones:
+        pares = obtener_pares_de_token(direccion)
+        pares_solana = [p for p in pares if p.get("chainId") == "solana"]
+        todos_los_pares.extend(pares_solana)
+        time.sleep(0.3)  # pausa breve para no saturar la API
+    return todos_los_pares
 
 
 def cumple_filtros(par: dict) -> bool:
