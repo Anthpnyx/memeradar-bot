@@ -182,7 +182,7 @@ def enviar_alerta_telegram(par: dict) -> None:
 
     mensaje = (
         f"🚨 *Token nuevo detectado*\n\n"
-        f"*{nombre}* (${simbolo})\n"
+        f"*{nombre}* ({simbolo})\n"
         f"💰 *Precio:* ${precio}\n"
         f"📊 *Market cap:* ${market_cap:,.0f}\n"
         f"💧 *Liquidez:* ${liquidez:,.0f}\n"
@@ -217,7 +217,7 @@ def enviar_alerta_telegram(par: dict) -> None:
     try:
         requests.post(url_telegram, json=payload, timeout=10)
     except Exception as e:
-        log.error(f"Error enviando alerta: {e}")
+        log.error(f"Error sending alert: {e}")
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -225,7 +225,6 @@ def enviar_alerta_telegram(par: dict) -> None:
 # ──────────────────────────────────────────────────────────────────────────
 
 def procesar_actualizaciones_telegram():
-    """Revisa las interacciones asegurándose de limpiar el historial siempre para no congelarse."""
     url_updates = f"https://telegram.org{TELEGRAM_TOKEN}/getUpdates"
     try:
         resp = requests.get(url_updates, params={"timeout": 1, "allowed_updates": ["message", "callback_query"]}, timeout=5)
@@ -237,7 +236,6 @@ def procesar_actualizaciones_telegram():
         for u in updates:
             ultimo_id = u.get("update_id")
             
-            # Detectar comando /portafolio
             if "message" in u and "text" in u["message"]:
                 msg_text = u["message"]["text"]
                 chat_id_remitente = str(u["message"]["chat"]["id"])
@@ -245,17 +243,21 @@ def procesar_actualizaciones_telegram():
                 if msg_text == "/portafolio" and chat_id_remitente == CHAT_ID:
                     enviar_resumen_portafolio()
 
-            # Detectar clics en botones
             elif "callback_query" in u:
                 cb = u["callback_query"]
                 cb_id = cb.get("id")
                 data = cb.get("data", "")
                 
                 if data.startswith("sim_"):
-                    # Corrección del separador de comillas vacías a guion bajo
-                    _, address, simbolo, precio_entrada = data.split("_")
-                    
-                    nueva_sim = {
-                        "address": address,
-                        "simbolo": simbolo,
-                        "precio_entrada": float(precio_entrada),
+                    parts = data.split("_")
+                    if len(parts) >= 4:
+                        address = parts[1]
+                        simbolo = parts[2]
+                        precio_entrada = parts[3]
+                        
+                        nueva_sim = {
+                            "address": address,
+                            "simbolo": simbolo,
+                            "precio_entrada": float(precio_entrada),
+                            "timestamp": datetime.now(timezone.utc).timestamp()
+                        }
