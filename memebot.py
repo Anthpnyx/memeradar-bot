@@ -1,5 +1,5 @@
 """
-MemeBot - Bot de Telegram para detectar memecoins nuevas con potencial en Solana
+MemeBot - Versión Estable Oficial para Railway (Python 3.10)
 Incluye: Filtro de Social Hype, Simulador de Papel (S/. 100) y Comando /portafolio
 =================================================================================
 """
@@ -10,6 +10,8 @@ import json
 import logging
 import requests
 from datetime import datetime, timezone
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.ext import Updater, CommandHandler, CallbackQueryHandler, CallbackContext
 
 # ──────────────────────────────────────────────────────────────────────────
 # CONFIGURACIÓN
@@ -47,7 +49,10 @@ log = logging.getLogger("memebot")
 def cargar_tokens_vistos() -> set:
     if os.path.exists(SEEN_TOKENS_FILE):
         with open(SEEN_TOKENS_FILE, "r") as f:
-            return set(json.load(f))
+            try:
+                return set(json.load(f))
+            except Exception:
+                return set()
     return set()
 
 def guardar_tokens_vistos(vistos: set) -> None:
@@ -57,7 +62,10 @@ def guardar_tokens_vistos(vistos: set) -> None:
 def cargar_simulaciones() -> list:
     if os.path.exists(SIMULATIONS_FILE):
         with open(SIMULATIONS_FILE, "r") as f:
-            return json.load(f)
+            try:
+                return json.load(f)
+            except Exception:
+                return []
     return []
 
 def guardar_simulacion(nueva_sim: dict) -> None:
@@ -78,7 +86,7 @@ def obtener_direcciones_tokens_nuevos() -> list:
         resp.raise_for_status()
         perfiles = resp.json() or []
         return [p.get("tokenAddress") for p in perfiles if p.get("chainId") == "solana" and p.get("tokenAddress")]
-    except requests.RequestException as e:
+    except Exception as e:
         log.warning(f"Error consultando perfiles nuevos: {e}")
         return []
 
@@ -89,7 +97,7 @@ def obtener_pares_de_token(direccion: str) -> list:
         resp.raise_for_status()
         data = resp.json()
         return data.get("pairs", []) or []
-    except requests.RequestException as e:
+    except Exception as e:
         log.warning(f"Error consultando pares de {direccion}: {e}")
         return []
 
@@ -100,7 +108,7 @@ def obtener_tokens_nuevos_solana() -> list:
         pares = obtener_pares_de_token(direccion)
         pares_solana = [p for p in pares if p.get("chainId") == "solana"]
         todos_los_pares.extend(pares_solana)
-        time.sleep(0.3)
+        time.sleep(0.2)
     return todos_los_pares
 
 def obtener_concentracion_top10(direccion_token: str):
@@ -118,11 +126,6 @@ def obtener_concentracion_top10(direccion_token: str):
     except Exception as e:
         log.warning(f"No se pudo calcular holders para {direccion_token}: {e}")
         return None
-
-
-# ──────────────────────────────────────────────────────────────────────────
-# FILTROS Y LÓGICA DE SOCIAL HYPE
-# ──────────────────────────────────────────────────────────────────────────
 
 def cumple_filtros(par: dict) -> bool:
     try:
@@ -153,15 +156,14 @@ def cumple_filtros(par: dict) -> bool:
 
         return True
     except Exception as e:
-        log.error(f"Error en filtros: {e}")
         return False
 
 
 # ──────────────────────────────────────────────────────────────────────────
-# ALERTAS Y BOTONES INTERACTIVOS
+# ENVÍO DE ALERTAS
 # ──────────────────────────────────────────────────────────────────────────
 
-def enviar_alerta_telegram(par: dict) -> None:
+def enviar_alerta_telegram(bot, par: dict) -> None:
     token_address = par.get("baseToken", {}).get("address", "")
     nombre = par.get("baseToken", {}).get("name", "Unknown")
     simbolo = par.get("baseToken", {}).get("symbol", "TOKEN")
@@ -193,70 +195,64 @@ def enviar_alerta_telegram(par: dict) -> None:
         f"⚠️ *Verifica liquidez antes de simular u operar.*"
     )
 
-    reply_markup = {
-        "inline_keyboard": [
-            [
-                {"text": "📋 Copiar Contrato", "callback_data": f"copy|{token_address}"},
-                {"text": "🧪 Simular S/. 100", "callback_data": f"sim|{token_address}|{simbolo}|{precio}"}
-            ]
-        ]
-    }
-
-    url_telegram = f"https://telegram.org{TELEGRAM_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": CHAT_ID,
-        "text": mensaje,
-        "parse_mode": "Markdown",
-        "reply_markup": json.dumps(reply_markup),
-        "disable_web_page_preview": False
-    }
-
     if dex_url:
-        payload["text"] += f"\n\n🔗 [Ver en DexScreener]({dex_url})"
+        mensaje += f"\n\n🔗 [Ver en DexScreener]({dex_url})"
+
+    keyboard = [
+        [
+            InlineKeyboardButton("📋 Copiar Contrato", callback_data=f"copy|{token_address}"),
+            InlineKeyboardButton("🧪 Simular S/. 100", callback_data=f"sim|{token_address}|{simbolo}|{precio}")
+        ]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
 
     try:
-        requests.post(url_telegram, json=payload, timeout=10)
+        bot.send_message(chat_id=CHAT_ID, text=mensaje, parse_mode="Markdown", reply_markup=reply_markup, disable_web_page_preview=False)
     except Exception as e:
-        log.error(f"Error sending alert: {e}")
+        log.error(f"Error enviando alerta: {e}")
 
 
 # ──────────────────────────────────────────────────────────────────────────
-# MANEJO DEL SIMULADOR - CORREGIDO Y VERIFICADO CON ÍNDICES EXPLÍCITOS
+# MANEJO DE COMANDOS Y CALLBACKS (OFICIAL)
 # ──────────────────────────────────────────────────────────────────────────
 
-def procesar_actualizaciones_telegram():
-    url_updates = f"https://telegram.org{TELEGRAM_TOKEN}/getUpdates"
-    try:
-        resp = requests.get(url_updates, params={"timeout": 1, "allowed_updates": ["message", "callback_query"]}, timeout=5)
-        if resp.status_code != 200: return
+def portafolio_command(update: Update, context: CallbackContext) -> None:
+    chat_id = str(update.effective_chat.id)
+    if chat_id != CHAT_ID: return
 
-        updates = resp.json().get("result", [])
-        ultimo_id = 0
+    simulaciones = cargar_simulaciones()
+    if not simulaciones:
+        update.message.reply_text("📁 Tu portafolio de simulación está vacío. ¡Presiona el botón de simular en las alertas!")
+        return
+
+    texto_reporte = "📊 *RESUMEN DE TU PORTAFOLIO FICTICIO (P&L)*\n\n"
+    total_invertido_soles = len(simulaciones) * 100
+    total_actual_soles = 0.0
+
+    for sim in simulaciones:
+        addr = sim["address"]
+        sym = sim["simbolo"]
+        p_entrada = sim["precio_entrada"]
         
-        for u in updates:
-            ultimo_id = u.get("update_id")
+        pares = obtener_pares_de_token(addr)
+        p_actual = p_entrada
+        if pares:
+            try:
+                p_actual = float(pares[0].get("priceUsd", p_entrada))
+            except Exception:
+                p_actual = p_entrada
             
-            if "message" in u and "text" in u["message"]:
-                msg_text = u["message"]["text"]
-                chat_id_remitente = str(u["message"]["chat"]["id"])
-                
-                if msg_text == "/portafolio" and chat_id_remitente == CHAT_ID:
-                    enviar_resumen_portafolio()
+        rendimiento_pct = ((p_actual - p_entrada) / p_entrada) * 100 if p_entrada > 0 else 0
+        valor_actual_soles = 100 * (1 + (rendimiento_pct / 100))
+        total_actual_soles += valor_actual_soles
+        
+        emoji = "📈" if rendimiento_pct >= 0 else "📉"
+        texto_reporte += f"{emoji} *{sym}*:\n• Entrada: ${p_entrada}\n• Actual: ${p_actual}\n• Rendimiento: {rendimiento_pct:+.2f}%\n• Valor actual: S/. {valor_actual_soles:.2f}\n\n"
 
-            elif "callback_query" in u:
-                cb = u["callback_query"]
-                cb_id = cb.get("id")
-                data = cb.get("data", "")
-                
-                if data.startswith("sim|"):
-                    parts = data.split("|")
-                    if len(parts) >= 4:
-                        # VERIFICADO LÍNEA POR LÍNEA: Índices fijos numéricos correctos
-                        address = parts[1]
-                        simbolo = parts[2]
-                        precio_entrada = parts[3]
-                        
-                        nueva_sim = {
-                            "address": address,
-                            "simbolo": simbolo,
-                            "precio_entrada": float(precio_entrada),
+    ganancia_neta_soles = total_actual_soles - total_invertido_soles
+    emoji_total = "🟢" if ganancia_neta_soles >= 0 else "🔴"
+    
+    texto_reporte += (
+        f"───────────────────\n"
+        f"💰 *Total Invertido:* S/. {total_invertido_soles:.2f}\n"
+        f"💵 *Valor de Mercado:* S/. {total_actual_soles:.2f}\n"
