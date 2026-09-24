@@ -251,7 +251,7 @@ def procesar_actualizaciones_telegram():
                 if data.startswith("sim_"):
                     parts = data.split("_")
                     if len(parts) >= 4:
-                        # POSICIONES ASIGNADAS CORRECTAMENTE EN PYTHON
+                        # POSICIONES ASIGNADAS CORRECTAMENTE MEDIANTE CORCHETES EN PYTHON
                         address = parts[1]
                         simbolo = parts[2]
                         precio_entrada = parts[3]
