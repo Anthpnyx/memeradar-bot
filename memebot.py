@@ -221,7 +221,7 @@ def enviar_alerta_telegram(par: dict) -> None:
 
 
 # ──────────────────────────────────────────────────────────────────────────
-# MANEJO DEL SIMULADOR Y REPARACIÓN DE VARIABLES
+# MANEJO DEL SIMULADOR Y VARIABLES CORREGIDAS CON CORCHETES
 # ──────────────────────────────────────────────────────────────────────────
 
 def procesar_actualizaciones_telegram():
@@ -251,7 +251,7 @@ def procesar_actualizaciones_telegram():
                 if data.startswith("sim_"):
                     parts = data.split("_")
                     if len(parts) >= 4:
-                        # CORRECCIÓN DEFINITIVA DE CORCHETES ASIGNADOS
+                        # POSICIONES ASIGNADAS CORRECTAMENTE EN PYTHON
                         address = parts[1]
                         simbolo = parts[2]
                         precio_entrada = parts[3]
