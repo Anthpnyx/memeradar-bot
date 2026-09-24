@@ -1,39 +1,6 @@
 """
 MemeBot - Bot de Telegram para detectar memecoins nuevas con potencial en Solana
 =================================================================================
-
-Qué hace:
-- Revisa periódicamente los pares/tokens nuevos en Solana usando la API pública
-  de DexScreener (gratis, sin necesidad de API key).
-- Filtra los tokens según criterios de "potencial" que tú defines (liquidez
-  mínima, volumen, ratio compradores/vendedores, etc.)
-- Envía una alerta a tu Telegram cuando encuentra un token que cumple los filtros.
-- Evita mandar el mismo token dos veces (guarda un registro local).
-
-Requisitos antes de correrlo:
-1. Python 3.9+
-2. Instalar dependencias:
-       pip install python-telegram-bot requests --break-system-packages
-3. Crear un bot de Telegram:
-       - Habla con @BotFather en Telegram
-       - Envía /newbot y sigue las instrucciones
-       - Copia el TOKEN que te da
-4. Obtener tu chat_id:
-       - Habla con @userinfobot en Telegram, te dirá tu ID numérico
-       - O usa el ID de un grupo/canal si quieres que llegue ahí
-5. Reemplaza las variables TELEGRAM_TOKEN y CHAT_ID abajo (o ponlas como
-   variables de entorno, más seguro).
-
-Cómo correrlo:
-       python memebot.py
-
-IMPORTANTE:
-- Este bot es una herramienta de DETECCIÓN, no de trading automático. No compra
-  ni vende nada por ti. Te avisa, tú decides.
-- Los filtros por defecto son un punto de partida. Ajústalos según tu propio
-  criterio de riesgo (ver sección FILTROS más abajo).
-- Ningún filtro elimina el riesgo de rug pulls o pérdidas. Esto es una ayuda
-  para filtrar ruido, no una garantía de nada.
 """
 
 import os
@@ -69,9 +36,8 @@ FILTROS = {
     "holders_top10_maximo_pct": 35,     # rechaza tokens muy concentrados (riesgo de manipulación/rug)
 }
 
-# RPC público de Solana (oficial, gratis, sin API key) — usado para calcular
-# qué % del suministro tienen las 10 wallets más grandes de un token
-SOLANA_RPC_URL = "https://api.mainnet-beta.solana.com"
+# RPC público de Solana — usado para calcular qué % del suministro tienen las 10 wallets más grandes
+SOLANA_RPC_URL = "https://solana.com"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -98,13 +64,7 @@ def guardar_tokens_vistos(vistos: set) -> None:
 
 
 def obtener_direcciones_tokens_nuevos() -> list:
-    """
-    Consulta el endpoint de 'perfiles de token más recientes' de DexScreener.
-    Este endpoint sí refleja tokens que acaban de aparecer, a diferencia de
-    /search que devuelve siempre resultados similares para la misma consulta.
-    Devuelve una lista de direcciones de contrato en Solana.
-    """
-    url = "https://api.dexscreener.com/token-profiles/latest/v1"
+    url = "https://dexscreener.com"
     try:
         resp = requests.get(url, timeout=15)
         resp.raise_for_status()
@@ -121,10 +81,7 @@ def obtener_direcciones_tokens_nuevos() -> list:
 
 
 def obtener_pares_de_token(direccion: str) -> list:
-    """
-    Dado un token address, trae sus pares de trading (liquidez, volumen, etc.)
-    """
-    url = f"https://api.dexscreener.com/latest/dex/tokens/{direccion}"
+    url = f"https://dexscreener.com{direccion}"
     try:
         resp = requests.get(url, timeout=15)
         resp.raise_for_status()
@@ -136,28 +93,18 @@ def obtener_pares_de_token(direccion: str) -> list:
 
 
 def obtener_tokens_nuevos_solana() -> list:
-    """
-    Combina los pasos anteriores: obtiene tokens recién listados en Solana
-    y trae los datos completos de sus pares de trading.
-    """
     direcciones = obtener_direcciones_tokens_nuevos()
     todos_los_pares = []
     for direccion in direcciones:
         pares = obtener_pares_de_token(direccion)
         pares_solana = [p for p in pares if p.get("chainId") == "solana"]
         todos_los_pares.extend(pares_solana)
-        time.sleep(0.3)  # pausa breve para no saturar la API
+        time.sleep(0.3)
     return todos_los_pares
 
 
 def obtener_concentracion_top10(direccion_token: str):
-    """
-    Calcula qué % del suministro total tienen las 10 wallets más grandes,
-    usando el RPC oficial y gratuito de Solana (sin API key).
-    Devuelve un float (porcentaje) o None si no se pudo calcular.
-    """
     try:
-        # 1) Suministro total del token
         resp_supply = requests.post(
             SOLANA_RPC_URL,
             json={
@@ -175,7 +122,6 @@ def obtener_concentracion_top10(direccion_token: str):
         if total_supply <= 0:
             return None
 
-        # 2) Las cuentas con más tokens (hasta 20, tomamos las primeras 10)
         resp_top = requests.post(
             SOLANA_RPC_URL,
             json={
@@ -198,13 +144,12 @@ def obtener_concentracion_top10(direccion_token: str):
 
 
 def cumple_filtros(par: dict) -> bool:
-    """Aplica los criterios definidos en FILTROS a un par de DexScreener."""
     try:
         liquidez = float(par.get("liquidity", {}).get("usd") or 0)
         volumen_24h = float(par.get("volume", {}).get("h24") or 0)
         market_cap = float(par.get("fdv") or par.get("marketCap") or 0)
         cambio_5m = float(par.get("priceChange", {}).get("m5") or 0)
-        creado_ts = par.get("pairCreatedAt")  # milisegundos epoch
+        creado_ts = par.get("pairCreatedAt")
 
         if not creado_ts:
             return False
@@ -217,145 +162,109 @@ def cumple_filtros(par: dict) -> bool:
             return False
         if volumen_24h < FILTROS["volumen_24h_minimo_usd"]:
             return False
-        if edad_horas > FILTROS["edad_maxima_horas"]:
-            return False
         if market_cap > FILTROS["market_cap_maximo_usd"]:
+            return False
+        if edad_horas > FILTROS["edad_maxima_horas"]:
             return False
         if cambio_5m < FILTROS["cambio_precio_5m_minimo_pct"]:
             return False
 
         return True
-    except (TypeError, ValueError):
+    except Exception as e:
+        log.error(f"Error evaluando filtros: {e}")
         return False
 
 
-def formatear_alerta_completa(par: dict, concentracion_top10=None) -> str:
-    """Arma el texto del mensaje de Telegram con toda la info clave del token."""
-    nombre = par.get("baseToken", {}).get("name", "?")
-    simbolo = par.get("baseToken", {}).get("symbol", "?")
-    direccion = par.get("baseToken", {}).get("address", "?")
-    precio = par.get("priceUsd", "?")
+def enviar_alerta_telegram(par: dict) -> None:
+    """Envía la alerta regresando la vista previa de DexScreener y dejando un solo botón."""
+    token_address = par.get("baseToken", {}).get("address", "")
+    nombre = par.get("baseToken", {}).get("name", "Unknown")
+    simbolo = par.get("baseToken", {}).get("symbol", "TOKEN")
+    precio = par.get("priceUsd", "0.00")
     liquidez = par.get("liquidity", {}).get("usd", 0)
-    volumen = par.get("volume", {}).get("h24", 0)
     market_cap = par.get("fdv") or par.get("marketCap") or 0
+    volumen_24h = par.get("volume", {}).get("h24", 0)
     cambio_5m = par.get("priceChange", {}).get("m5", 0)
+    dex_url = par.get("url", "")
 
-    if concentracion_top10 is not None:
-        linea_holders = f"👥 Top 10 holders: {concentracion_top10:.1f}% del suministro\n"
-    else:
-        linea_holders = ""
-
-    return (
-        "🚨 *Token nuevo detectado*\n\n"
-        f"*{nombre}* (${simbolo})\n"
-        f"💰 Precio: ${precio}\n"
-        f"📊 Market cap: ${float(market_cap):,.0f}\n"
-        f"💧 Liquidez: ${float(liquidez):,.0f}\n"
-        f"📈 Volumen 24h: ${float(volumen):,.0f}\n"
-        f"⚡ Cambio 5min: {cambio_5m}%\n"
-        f"{linea_holders}"
-        f"📄 Contrato:\n"
-        f"`{direccion}`\n\n"
-        f"⚠️ Verifica liquidez y holders antes de comprar. Esto es una alerta, no una recomendación."
+    # Mantiene tu diseño original con el contrato copiable con un toque
+    mensaje = (
+        f"🚨 *Token nuevo detectado*\n\n"
+        f"*{nombre}* (\${simbolo})\n"
+        f"💰 *Precio:* \${precio}\n"
+        f"📊 *Market cap:* \${market_cap:,.0f}\n"
+        f"💧 *Liquidez:* \${liquidez:,.0f}\n"
+        f"📈 *Volumen 24h:* \${volumen_24h:,.0f}\n"
+        f"⚡ *Cambio 5min:* {cambio_5m}%\n\n"
+        f"📄 *Contrato:*\n`{token_address}`\n\n"
+        f"⚠️ *Verifica liquidez y holders antes de comprar. Esto es una alerta, no una recomendación.*"
     )
 
-
-def construir_botones(direccion: str, url: str) -> dict:
-    """
-    Arma el teclado inline con dos botones:
-    - 'Copiar Contrato': usa el botón nativo de copiar texto de Telegram
-      (disponible desde Bot API 7.0), copia la dirección con un solo toque.
-    - 'Ver en DexScreener': abre el link directo a la página del token.
-    """
-    return {
+    # UN SOLO BOTÓN INTERACTIVO: Copiar contrato
+    reply_markup = {
         "inline_keyboard": [
             [
-                {"text": "📋 Copiar Contrato", "copy_text": {"text": direccion}},
-                {"text": "📊 Ver en DexScreener", "url": url},
+                {
+                    "text": "📋 Copiar Contrato",
+                    "callback_data": f"copy_{token_address}"
+                }
             ]
         ]
     }
 
-
-def enviar_alerta_telegram(mensaje: str, botones: dict = None) -> None:
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    url_telegram = f"https://telegram.org{TELEGRAM_TOKEN}/sendMessage"
     payload = {
         "chat_id": CHAT_ID,
         "text": mensaje,
         "parse_mode": "Markdown",
-        "disable_web_page_preview": True,
+        "reply_markup": json.dumps(reply_markup),
+        "disable_web_page_preview": False  # REGRESA LA VISTA PREVIA ORIGINAL DE DEXSCREENER
     }
-    if botones:
-        payload["reply_markup"] = botones
+
+    # Si hay link de DexScreener, lo agrega al texto para que Telegram dibuje la vista previa grande
+    if dex_url:
+        payload["text"] += f"\n\n🔗 [Ver en DexScreener]({dex_url})"
+
     try:
-        resp = requests.post(url, json=payload, timeout=10)
+        resp = requests.post(url_telegram, json=payload, timeout=10)
         resp.raise_for_status()
+        log.info(f"Alerta enviada para el token {simbolo}")
     except requests.RequestException as e:
-        log.warning(f"Error enviando mensaje a Telegram: {e}")
+        log.error(f"Error multimedia o envío a Telegram: {e}")
 
 
-# ──────────────────────────────────────────────────────────────────────────
-# LOOP PRINCIPAL
-# ──────────────────────────────────────────────────────────────────────────
-
-def main():
-    log.info("Iniciando MemeBot...")
-
-    if TELEGRAM_TOKEN == "PON_AQUI_TU_TOKEN" or CHAT_ID == "PON_AQUI_TU_CHAT_ID":
-        log.error(
-            "Falta configurar TELEGRAM_TOKEN y CHAT_ID. "
-            "Edita las variables al inicio del archivo o usa variables de entorno."
-        )
-        return
-
-    vistos = cargar_tokens_vistos()
-    log.info(f"Cargados {len(vistos)} tokens ya vistos previamente.")
+def ejecutar_bot():
+    log.info("Memebot iniciado correctamente. Escaneando Solana...")
+    tokens_vistos = cargar_tokens_vistos()
 
     while True:
         try:
-            pares = obtener_tokens_nuevos_solana()
-            log.info(f"Consultados {len(pares)} pares de Solana.")
-
-            nuevos_encontrados = 0
-            for par in pares:
-                direccion = par.get("baseToken", {}).get("address")
-                if not direccion or direccion in vistos:
+            pares_nuevos = obtener_tokens_nuevos_solana()
+            for par in pares_nuevos:
+                token_address = par.get("baseToken", {}).get("address")
+                if not token_address or token_address in tokens_vistos:
                     continue
 
                 if cumple_filtros(par):
-                    concentracion = obtener_concentracion_top10(direccion)
-                    if (
-                        concentracion is not None
-                        and concentracion > FILTROS["holders_top10_maximo_pct"]
-                    ):
-                        log.info(
-                            f"Descartado por concentración alta: "
-                            f"{par.get('baseToken', {}).get('symbol')} "
-                            f"({concentracion:.1f}% en top 10)"
-                        )
-                        vistos.add(direccion)
+                    # El Top 10 se calcula internamente y actúa como filtro silencioso como querías
+                    top10_pct = obtener_concentracion_top10(token_address)
+                    
+                    if top10_pct and top10_pct > FILTROS["holders_top10_maximo_pct"]:
+                        log.info(f"Token ignorado por alta concentración de holders ({top10_pct:.2f}%)")
+                        tokens_vistos.add(token_address)
                         continue
 
-                    mensaje = formatear_alerta_completa(par, concentracion)
-                    botones = construir_botones(direccion, par.get("url", ""))
-                    enviar_alerta_telegram(mensaje, botones)
-                    vistos.add(direccion)
-                    nuevos_encontrados += 1
-                    log.info(f"Alerta enviada: {par.get('baseToken', {}).get('symbol')}")
-                else:
-                    # lo marcamos como visto igual para no re-evaluarlo cada vez
-                    vistos.add(direccion)
+                    # Enviamos la alerta sin agregar botones extra
+                    enviar_alerta_telegram(par)
+                    tokens_vistos.add(token_address)
+                    guardar_tokens_vistos(tokens_vistos)
 
-            if nuevos_encontrados > 0:
-                guardar_tokens_vistos(vistos)
-
-            log.info(f"Ciclo completo. {nuevos_encontrados} alertas nuevas enviadas.")
-
+            time.sleep(POLL_INTERVAL_SECONDS)
         except Exception as e:
-            log.error(f"Error inesperado en el loop principal: {e}")
-
-        time.sleep(POLL_INTERVAL_SECONDS)
+            log.error(f"Error en el bucle principal: {e}")
+            time.sleep(10)
 
 
 if __name__ == "__main__":
-    main()
+    ejecutar_bot()
+
