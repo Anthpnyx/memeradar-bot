@@ -66,7 +66,12 @@ FILTROS = {
     "edad_maxima_horas": 48,            # solo tokens lanzados hace menos de X horas
     "market_cap_maximo_usd": 10_000_000,# evita tokens que ya "explotaron" y subir es más difícil
     "cambio_precio_5m_minimo_pct": 2,   # solo sube (no baja): mínimo % de subida en 5 min
+    "holders_top10_maximo_pct": 35,     # rechaza tokens muy concentrados (riesgo de manipulación/rug)
 }
+
+# RPC público de Solana (oficial, gratis, sin API key) — usado para calcular
+# qué % del suministro tienen las 10 wallets más grandes de un token
+SOLANA_RPC_URL = "https://api.mainnet-beta.solana.com"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -145,6 +150,53 @@ def obtener_tokens_nuevos_solana() -> list:
     return todos_los_pares
 
 
+def obtener_concentracion_top10(direccion_token: str):
+    """
+    Calcula qué % del suministro total tienen las 10 wallets más grandes,
+    usando el RPC oficial y gratuito de Solana (sin API key).
+    Devuelve un float (porcentaje) o None si no se pudo calcular.
+    """
+    try:
+        # 1) Suministro total del token
+        resp_supply = requests.post(
+            SOLANA_RPC_URL,
+            json={
+                "jsonrpc": "2.0", "id": 1,
+                "method": "getTokenSupply",
+                "params": [direccion_token],
+            },
+            timeout=10,
+        )
+        resp_supply.raise_for_status()
+        supply_data = resp_supply.json()
+        total_supply = float(
+            supply_data.get("result", {}).get("value", {}).get("uiAmount") or 0
+        )
+        if total_supply <= 0:
+            return None
+
+        # 2) Las cuentas con más tokens (hasta 20, tomamos las primeras 10)
+        resp_top = requests.post(
+            SOLANA_RPC_URL,
+            json={
+                "jsonrpc": "2.0", "id": 1,
+                "method": "getTokenLargestAccounts",
+                "params": [direccion_token],
+            },
+            timeout=10,
+        )
+        resp_top.raise_for_status()
+        top_data = resp_top.json()
+        cuentas = top_data.get("result", {}).get("value", []) or []
+        top10 = cuentas[:10]
+        suma_top10 = sum(float(c.get("uiAmount") or 0) for c in top10)
+
+        return (suma_top10 / total_supply) * 100
+    except (requests.RequestException, TypeError, ValueError, KeyError) as e:
+        log.warning(f"No se pudo calcular concentración de holders para {direccion_token}: {e}")
+        return None
+
+
 def cumple_filtros(par: dict) -> bool:
     """Aplica los criterios definidos en FILTROS a un par de DexScreener."""
     try:
@@ -177,8 +229,8 @@ def cumple_filtros(par: dict) -> bool:
         return False
 
 
-def formatear_alerta_completa(par: dict) -> str:
-    """Arma el mensaje de Telegram con toda la info clave del token."""
+def formatear_alerta_completa(par: dict, concentracion_top10=None) -> str:
+    """Arma el texto del mensaje de Telegram con toda la info clave del token."""
     nombre = par.get("baseToken", {}).get("name", "?")
     simbolo = par.get("baseToken", {}).get("symbol", "?")
     direccion = par.get("baseToken", {}).get("address", "?")
@@ -187,7 +239,11 @@ def formatear_alerta_completa(par: dict) -> str:
     volumen = par.get("volume", {}).get("h24", 0)
     market_cap = par.get("fdv") or par.get("marketCap") or 0
     cambio_5m = par.get("priceChange", {}).get("m5", 0)
-    url = par.get("url", "")
+
+    if concentracion_top10 is not None:
+        linea_holders = f"👥 Top 10 holders: {concentracion_top10:.1f}% del suministro\n"
+    else:
+        linea_holders = ""
 
     return (
         "🚨 *Token nuevo detectado*\n\n"
@@ -196,21 +252,41 @@ def formatear_alerta_completa(par: dict) -> str:
         f"📊 Market cap: ${float(market_cap):,.0f}\n"
         f"💧 Liquidez: ${float(liquidez):,.0f}\n"
         f"📈 Volumen 24h: ${float(volumen):,.0f}\n"
-        f"⚡ Cambio 5min: {cambio_5m}%\n\n"
-        f"📄 Contrato: `{direccion}`\n"
-        f"🔗 [Ver en DexScreener]({url})\n\n"
+        f"⚡ Cambio 5min: {cambio_5m}%\n"
+        f"{linea_holders}"
+        f"📄 Contrato:\n"
+        f"`{direccion}`\n\n"
         f"⚠️ Verifica liquidez y holders antes de comprar. Esto es una alerta, no una recomendación."
     )
 
 
-def enviar_alerta_telegram(mensaje: str) -> None:
+def construir_botones(direccion: str, url: str) -> dict:
+    """
+    Arma el teclado inline con dos botones:
+    - 'Copiar Contrato': usa el botón nativo de copiar texto de Telegram
+      (disponible desde Bot API 7.0), copia la dirección con un solo toque.
+    - 'Ver en DexScreener': abre el link directo a la página del token.
+    """
+    return {
+        "inline_keyboard": [
+            [
+                {"text": "📋 Copiar Contrato", "copy_text": {"text": direccion}},
+                {"text": "📊 Ver en DexScreener", "url": url},
+            ]
+        ]
+    }
+
+
+def enviar_alerta_telegram(mensaje: str, botones: dict = None) -> None:
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {
         "chat_id": CHAT_ID,
         "text": mensaje,
         "parse_mode": "Markdown",
-        "disable_web_page_preview": False,
+        "disable_web_page_preview": True,
     }
+    if botones:
+        payload["reply_markup"] = botones
     try:
         resp = requests.post(url, json=payload, timeout=10)
         resp.raise_for_status()
@@ -247,8 +323,22 @@ def main():
                     continue
 
                 if cumple_filtros(par):
-                    mensaje = formatear_alerta_completa(par)
-                    enviar_alerta_telegram(mensaje)
+                    concentracion = obtener_concentracion_top10(direccion)
+                    if (
+                        concentracion is not None
+                        and concentracion > FILTROS["holders_top10_maximo_pct"]
+                    ):
+                        log.info(
+                            f"Descartado por concentración alta: "
+                            f"{par.get('baseToken', {}).get('symbol')} "
+                            f"({concentracion:.1f}% en top 10)"
+                        )
+                        vistos.add(direccion)
+                        continue
+
+                    mensaje = formatear_alerta_completa(par, concentracion)
+                    botones = construir_botones(direccion, par.get("url", ""))
+                    enviar_alerta_telegram(mensaje, botones)
                     vistos.add(direccion)
                     nuevos_encontrados += 1
                     log.info(f"Alerta enviada: {par.get('baseToken', {}).get('symbol')}")
