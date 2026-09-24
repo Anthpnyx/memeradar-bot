@@ -196,8 +196,8 @@ def enviar_alerta_telegram(par: dict) -> None:
     reply_markup = {
         "inline_keyboard": [
             [
-                {"text": "📋 Copiar Contrato", "callback_data": f"copy_{token_address}"},
-                {"text": "🧪 Simular S/. 100", "callback_data": f"sim_{token_address}_{simbolo}_{precio}"}
+                {"text": "📋 Copiar Contrato", "callback_data": f"copy|{token_address}"},
+                {"text": "🧪 Simular S/. 100", "callback_data": f"sim|{token_address}|{simbolo}|{precio}"}
             ]
         ]
     }
@@ -221,7 +221,7 @@ def enviar_alerta_telegram(par: dict) -> None:
 
 
 # ──────────────────────────────────────────────────────────────────────────
-# MANEJO DEL SIMULADOR Y SINTAXIS COMPLETAMENTE RESUELTA
+# MANEJO DEL SIMULADOR CORREGIDO (LÓGICA CON SEPARADOR '|')
 # ──────────────────────────────────────────────────────────────────────────
 
 def procesar_actualizaciones_telegram():
@@ -248,10 +248,10 @@ def procesar_actualizaciones_telegram():
                 cb_id = cb.get("id")
                 data = cb.get("data", "")
                 
-                if data.startswith("sim_"):
-                    parts = data.split("_")
+                # Usamos una barra recta '|' para separar los datos sin conflictos
+                if data.startswith("sim|"):
+                    parts = data.split("|")
                     if len(parts) >= 4:
-                        # ASIGNACIÓN DE ARRAYS CORREGIDA CON ÍNDICES CORRESPONDIENTES
                         address = parts[1]
                         simbolo = parts[2]
                         precio_entrada = parts[3]
