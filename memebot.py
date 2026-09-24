@@ -1,7 +1,39 @@
 """
 MemeBot - Bot de Telegram para detectar memecoins nuevas con potencial en Solana
-Incluye: Filtro de Social Hype, Simulador de Papel (S/. 100) y Comando /portafolio
 =================================================================================
+
+Qué hace:
+- Revisa periódicamente los pares/tokens nuevos en Solana usando la API pública
+  de DexScreener (gratis, sin necesidad de API key).
+- Filtra los tokens según criterios de "potencial" que tú defines (liquidez
+  mínima, volumen, ratio compradores/vendedores, etc.)
+- Envía una alerta a tu Telegram cuando encuentra un token que cumple los filtros.
+- Evita mandar el mismo token dos veces (guarda un registro local).
+
+Requisitos antes de correrlo:
+1. Python 3.9+
+2. Instalar dependencias:
+       pip install python-telegram-bot requests --break-system-packages
+3. Crear un bot de Telegram:
+       - Habla con @BotFather en Telegram
+       - Envía /newbot y sigue las instrucciones
+       - Copia el TOKEN que te da
+4. Obtener tu chat_id:
+       - Habla con @userinfobot en Telegram, te dirá tu ID numérico
+       - O usa el ID de un grupo/canal si quieres que llegue ahí
+5. Reemplaza las variables TELEGRAM_TOKEN y CHAT_ID abajo (o ponlas como
+   variables de entorno, más seguro).
+
+Cómo correrlo:
+       python memebot.py
+
+IMPORTANTE:
+- Este bot es una herramienta de DETECCIÓN, no de trading automático. No compra
+  ni vende nada por ti. Te avisa, tú decides.
+- Los filtros por defecto son un punto de partida. Ajústalos según tu propio
+  criterio de riesgo (ver sección FILTROS más abajo).
+- Ningún filtro elimina el riesgo de rug pulls o pérdidas. Esto es una ayuda
+  para filtrar ruido, no una garantía de nada.
 """
 
 import os
@@ -21,21 +53,24 @@ CHAT_ID = os.getenv("MEMEBOT_CHAT_ID", "PON_AQUI_TU_CHAT_ID")
 # Cada cuánto revisa tokens nuevos (en segundos)
 POLL_INTERVAL_SECONDS = 60
 
-# Archivos locales de registro
+# Archivo donde guarda qué tokens ya avisó, para no repetir alertas
 SEEN_TOKENS_FILE = "seen_tokens.json"
-SIMULATIONS_FILE = "simulaciones.json"
 
-# FILTROS
+# ──────────────────────────────────────────────────────────────────────────
+# FILTROS — Ajusta esto según qué tan arriesgado quieras ser
+# ──────────────────────────────────────────────────────────────────────────
+
 FILTROS = {
-    "liquidez_minima_usd": 3_000,       
-    "volumen_24h_minimo_usd": 5_000,    
-    "edad_maxima_horas": 48,            
-    "market_cap_maximo_usd": 10_000_000,
-    "cambio_precio_5m_minimo_pct": 2,   
-    "holders_top10_maximo_pct": 35,     
+    "liquidez_minima_usd": 3_000,       # ignora tokens con menos liquidez que esto
+    "volumen_24h_minimo_usd": 5_000,    # actividad mínima reciente
+    "edad_maxima_horas": 48,            # solo tokens lanzados hace menos de X horas
+    "market_cap_maximo_usd": 10_000_000,# evita tokens que ya "explotaron" y subir es más difícil
+    "cambio_precio_5m_minimo_pct": 2,   # solo sube (no baja): mínimo % de subida en 5 min
+    "holders_top10_maximo_pct": 35,     # rechaza tokens muy concentrados (riesgo de manipulación/rug)
 }
 
-# RPC público de Solana
+# RPC público de Solana (oficial, gratis, sin API key) — usado para calcular
+# qué % del suministro tienen las 10 wallets más grandes de un token
 SOLANA_RPC_URL = "https://api.mainnet-beta.solana.com"
 
 logging.basicConfig(
@@ -46,40 +81,29 @@ log = logging.getLogger("memebot")
 
 
 # ──────────────────────────────────────────────────────────────────────────
-# GESTIÓN DE ARCHIVOS LOCALES
+# FUNCIONES
 # ──────────────────────────────────────────────────────────────────────────
 
 def cargar_tokens_vistos() -> set:
+    """Carga la lista de tokens que ya avisamos antes."""
     if os.path.exists(SEEN_TOKENS_FILE):
         with open(SEEN_TOKENS_FILE, "r") as f:
             return set(json.load(f))
     return set()
 
+
 def guardar_tokens_vistos(vistos: set) -> None:
     with open(SEEN_TOKENS_FILE, "w") as f:
         json.dump(list(vistos), f)
 
-def cargar_simulaciones() -> list:
-    if os.path.exists(SIMULATIONS_FILE):
-        with open(SIMULATIONS_FILE, "r") as f:
-            try:
-                return json.load(f)
-            except Exception:
-                return []
-    return []
-
-def guardar_simulacion(nueva_sim: dict) -> None:
-    simulaciones = cargar_simulaciones()
-    simulaciones.append(nueva_sim)
-    with open(SIMULATIONS_FILE, "w") as f:
-        json.dump(simulaciones, f, indent=4)
-
-
-# ──────────────────────────────────────────────────────────────────────────
-# CONEXIÓN CON APIS
-# ──────────────────────────────────────────────────────────────────────────
 
 def obtener_direcciones_tokens_nuevos() -> list:
+    """
+    Consulta el endpoint de 'perfiles de token más recientes' de DexScreener.
+    Este endpoint sí refleja tokens que acaban de aparecer, a diferencia de
+    /search que devuelve siempre resultados similares para la misma consulta.
+    Devuelve una lista de direcciones de contrato en Solana.
+    """
     url = "https://api.dexscreener.com/token-profiles/latest/v1"
     try:
         resp = requests.get(url, timeout=15)
@@ -95,7 +119,11 @@ def obtener_direcciones_tokens_nuevos() -> list:
         log.warning(f"Error consultando perfiles nuevos de DexScreener: {e}")
         return []
 
+
 def obtener_pares_de_token(direccion: str) -> list:
+    """
+    Dado un token address, trae sus pares de trading (liquidez, volumen, etc.)
+    """
     url = f"https://api.dexscreener.com/latest/dex/tokens/{direccion}"
     try:
         resp = requests.get(url, timeout=15)
@@ -106,172 +134,228 @@ def obtener_pares_de_token(direccion: str) -> list:
         log.warning(f"Error consultando pares de {direccion}: {e}")
         return []
 
+
 def obtener_tokens_nuevos_solana() -> list:
+    """
+    Combina los pasos anteriores: obtiene tokens recién listados en Solana
+    y trae los datos completos de sus pares de trading.
+    """
     direcciones = obtener_direcciones_tokens_nuevos()
     todos_los_pares = []
     for direccion in direcciones:
         pares = obtener_pares_de_token(direccion)
         pares_solana = [p for p in pares if p.get("chainId") == "solana"]
         todos_los_pares.extend(pares_solana)
-        time.sleep(0.3)
+        time.sleep(0.3)  # pausa breve para no saturar la API
     return todos_los_pares
 
+
 def obtener_concentracion_top10(direccion_token: str):
+    """
+    Calcula qué % del suministro total tienen las 10 wallets más grandes,
+    usando el RPC oficial y gratuito de Solana (sin API key).
+    Devuelve un float (porcentaje) o None si no se pudo calcular.
+    """
     try:
+        # 1) Suministro total del token
         resp_supply = requests.post(
             SOLANA_RPC_URL,
-            json={"jsonrpc": "2.0", "id": 1, "method": "getTokenSupply", "params": [direccion_token]},
+            json={
+                "jsonrpc": "2.0", "id": 1,
+                "method": "getTokenSupply",
+                "params": [direccion_token],
+            },
             timeout=10,
         )
         resp_supply.raise_for_status()
-        total_supply = float(resp_supply.json().get("result", {}).get("value", {}).get("uiAmount") or 0)
+        supply_data = resp_supply.json()
+        total_supply = float(
+            supply_data.get("result", {}).get("value", {}).get("uiAmount") or 0
+        )
         if total_supply <= 0:
             return None
 
+        # 2) Las cuentas con más tokens (hasta 20, tomamos las primeras 10)
         resp_top = requests.post(
             SOLANA_RPC_URL,
-            json={"jsonrpc": "2.0", "id": 1, "method": "getTokenLargestAccounts", "params": [direccion_token]},
+            json={
+                "jsonrpc": "2.0", "id": 1,
+                "method": "getTokenLargestAccounts",
+                "params": [direccion_token],
+            },
             timeout=10,
         )
         resp_top.raise_for_status()
-        cuentas = resp_top.json().get("result", {}).get("value", []) or []
-        suma_top10 = sum(float(c.get("uiAmount") or 0) for c in cuentas[:10])
+        top_data = resp_top.json()
+        cuentas = top_data.get("result", {}).get("value", []) or []
+        top10 = cuentas[:10]
+        suma_top10 = sum(float(c.get("uiAmount") or 0) for c in top10)
 
         return (suma_top10 / total_supply) * 100
-    except Exception as e:
+    except (requests.RequestException, TypeError, ValueError, KeyError) as e:
         log.warning(f"No se pudo calcular concentración de holders para {direccion_token}: {e}")
         return None
 
 
-# ──────────────────────────────────────────────────────────────────────────
-# FILTROS INCLUYENDO HYPE DE X
-# ──────────────────────────────────────────────────────────────────────────
-
 def cumple_filtros(par: dict) -> bool:
+    """Aplica los criterios definidos en FILTROS a un par de DexScreener."""
     try:
-        # FILTROS DE HYPE DE X: Valida si tiene cuenta de Twitter vinculada
-        info = par.get("info", {})
-        socials = info.get("socials", []) or []
-        tiene_twitter = any(s.get("type") == "twitter" for s in socials)
-        
-        if not tiene_twitter:
-            return False
-
         liquidez = float(par.get("liquidity", {}).get("usd") or 0)
         volumen_24h = float(par.get("volume", {}).get("h24") or 0)
         market_cap = float(par.get("fdv") or par.get("marketCap") or 0)
         cambio_5m = float(par.get("priceChange", {}).get("m5") or 0)
-        creado_ts = par.get("pairCreatedAt")
+        creado_ts = par.get("pairCreatedAt")  # milisegundos epoch
 
         if not creado_ts:
             return False
 
-        edad_horas = (datetime.now(timezone.utc).timestamp() - (creado_ts / 1000)) / 3600
+        edad_horas = (
+            datetime.now(timezone.utc).timestamp() - (creado_ts / 1000)
+        ) / 3600
 
         if liquidez < FILTROS["liquidez_minima_usd"]:
             return False
         if volumen_24h < FILTROS["volumen_24h_minimo_usd"]:
             return False
-        if market_cap > FILTROS["market_cap_maximo_usd"]:
-            return False
         if edad_horas > FILTROS["edad_maxima_horas"]:
+            return False
+        if market_cap > FILTROS["market_cap_maximo_usd"]:
             return False
         if cambio_5m < FILTROS["cambio_precio_5m_minimo_pct"]:
             return False
 
         return True
-    except Exception as e:
-        log.error(f"Error evaluando filtros: {e}")
+    except (TypeError, ValueError):
         return False
 
 
-# ──────────────────────────────────────────────────────────────────────────
-# FORMATO VISUAL CON BOTONES DEL SIMULADOR
-# ──────────────────────────────────────────────────────────────────────────
-
-def enviar_alerta_telegram(par: dict) -> None:
-    token_address = par.get("baseToken", {}).get("address", "")
-    nombre = par.get("baseToken", {}).get("name", "Unknown")
-    simbolo = par.get("baseToken", {}).get("symbol", "TOKEN")
-    precio = par.get("priceUsd", "0.00")
+def formatear_alerta_completa(par: dict, concentracion_top10=None) -> str:
+    """Arma el texto del mensaje de Telegram con toda la info clave del token."""
+    nombre = par.get("baseToken", {}).get("name", "?")
+    simbolo = par.get("baseToken", {}).get("symbol", "?")
+    direccion = par.get("baseToken", {}).get("address", "?")
+    precio = par.get("priceUsd", "?")
     liquidez = par.get("liquidity", {}).get("usd", 0)
+    volumen = par.get("volume", {}).get("h24", 0)
     market_cap = par.get("fdv") or par.get("marketCap") or 0
-    volumen_24h = par.get("volume", {}).get("h24", 0)
     cambio_5m = par.get("priceChange", {}).get("m5", 0)
-    dex_url = par.get("url", "")
 
-    info = par.get("info", {})
-    socials = info.get("socials", []) or []
-    twitter_url = next((s.get("url") for s in socials if s.get("type") == "twitter"), None)
+    if concentracion_top10 is not None:
+        linea_holders = f"👥 Top 10 holders: {concentracion_top10:.1f}% del suministro\n"
+    else:
+        linea_holders = ""
 
-    redes_texto = ""
-    if twitter_url:
-        redes_texto = f"🐦 *Twitter (X):* [Abrir Perfil]({twitter_url})\n"
-
-    mensaje = (
-        f"🚨 *Token nuevo detectado*\n\n"
-        f"*{nombre}* ({simbolo})\n"
-        f"💰 *Precio:* ${precio}\n"
-        f"📊 *Market cap:* ${market_cap:,.0f}\n"
-        f"💧 *Liquidez:* ${liquidez:,.0f}\n"
-        f"📈 *Volumen 24h:* ${volumen_24h:,.0f}\n"
-        f"⚡ *Cambio 5min:* {cambio_5m}%\n"
-        f"{redes_texto}\n"
-        f"📄 *Contrato:*\n`{token_address}`\n\n"
-        f"⚠️ *Verifica liquidez antes de simular u operar.*"
+    return (
+        "🚨 *Token nuevo detectado*\n\n"
+        f"*{nombre}* (${simbolo})\n"
+        f"💰 Precio: ${precio}\n"
+        f"📊 Market cap: ${float(market_cap):,.0f}\n"
+        f"💧 Liquidez: ${float(liquidez):,.0f}\n"
+        f"📈 Volumen 24h: ${float(volumen):,.0f}\n"
+        f"⚡ Cambio 5min: {cambio_5m}%\n"
+        f"{linea_holders}"
+        f"📄 Contrato:\n"
+        f"`{direccion}`\n\n"
+        f"⚠️ Verifica liquidez y holders antes de comprar. Esto es una alerta, no una recomendación."
     )
 
-    # BOTONES INTERACTIVOS SEGUROS USANDO '|' COMO SEPARADOR SIN ERRORES
-    reply_markup = {
+
+def construir_botones(direccion: str, url: str) -> dict:
+    """
+    Arma el teclado inline con dos botones:
+    - 'Copiar Contrato': usa el botón nativo de copiar texto de Telegram
+      (disponible desde Bot API 7.0), copia la dirección con un solo toque.
+    - 'Ver en DexScreener': abre el link directo a la página del token.
+    """
+    return {
         "inline_keyboard": [
             [
-                {"text": "📋 Copiar Contrato", "callback_data": f"copy|{token_address}"},
-                {"text": "🧪 Simular S/. 100", "callback_data": f"sim|{token_address}|{simbolo}|{precio}"}
+                {"text": "📋 Copiar Contrato", "copy_text": {"text": direccion}},
+                {"text": "📊 Ver en DexScreener", "url": url},
             ]
         ]
     }
 
-    url_telegram = f"https://telegram.org{TELEGRAM_TOKEN}/sendMessage"
+
+def enviar_alerta_telegram(mensaje: str, botones: dict = None) -> None:
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {
         "chat_id": CHAT_ID,
         "text": mensaje,
         "parse_mode": "Markdown",
-        "reply_markup": json.dumps(reply_markup),
-        "disable_web_page_preview": False  # MUESTRA EL CUADRO GRANDE DEL GRÁFICO
+        "disable_web_page_preview": True,
     }
-
-    if dex_url:
-        payload["text"] += f"\n\n🔗 [Ver en DexScreener]({dex_url})"
-
+    if botones:
+        payload["reply_markup"] = botones
     try:
-        requests.post(url_telegram, json=payload, timeout=10)
-        log.info(f"Alerta enviada para el token {simbolo}")
-    except Exception as e:
-        log.error(f"Error enviando mensaje a Telegram: {e}")
+        resp = requests.post(url, json=payload, timeout=10)
+        resp.raise_for_status()
+    except requests.RequestException as e:
+        log.warning(f"Error enviando mensaje a Telegram: {e}")
 
 
 # ──────────────────────────────────────────────────────────────────────────
-# MANEJO ASÍNCRONO DEL COMANDO /PORTAFOLIO Y CLICS
+# LOOP PRINCIPAL
 # ──────────────────────────────────────────────────────────────────────────
 
-def procesar_actualizaciones_telegram():
-    url_updates = f"https://telegram.org{TELEGRAM_TOKEN}/getUpdates"
-    try:
-        resp = requests.get(url_updates, params={"timeout": 1, "allowed_updates": ["message", "callback_query"]}, timeout=5)
-        if resp.status_code != 200: return
+def main():
+    log.info("Iniciando MemeBot...")
 
-        updates = resp.json().get("result", [])
-        ultimo_id = 0
-        
-        for u in updates:
-            ultimo_id = u.get("update_id")
-            
-            # Detectar comando /portafolio escrito por ti
-            if "message" in u and "text" in u["message"]:
-                msg_text = u["message"]["text"]
-                chat_id_remitente = str(u["message"]["chat"]["id"])
-                
-                if msg_text == "/portafolio" and chat_id_remitente == CHAT_ID:
-                    enviar_resumen_portafolio()
+    if TELEGRAM_TOKEN == "PON_AQUI_TU_TOKEN" or CHAT_ID == "PON_AQUI_TU_CHAT_ID":
+        log.error(
+            "Falta configurar TELEGRAM_TOKEN y CHAT_ID. "
+            "Edita las variables al inicio del archivo o usa variables de entorno."
+        )
+        return
 
-            # Detectar clics en los botones de simulación
+    vistos = cargar_tokens_vistos()
+    log.info(f"Cargados {len(vistos)} tokens ya vistos previamente.")
+
+    while True:
+        try:
+            pares = obtener_tokens_nuevos_solana()
+            log.info(f"Consultados {len(pares)} pares de Solana.")
+
+            nuevos_encontrados = 0
+            for par in pares:
+                direccion = par.get("baseToken", {}).get("address")
+                if not direccion or direccion in vistos:
+                    continue
+
+                if cumple_filtros(par):
+                    concentracion = obtener_concentracion_top10(direccion)
+                    if (
+                        concentracion is not None
+                        and concentracion > FILTROS["holders_top10_maximo_pct"]
+                    ):
+                        log.info(
+                            f"Descartado por concentración alta: "
+                            f"{par.get('baseToken', {}).get('symbol')} "
+                            f"({concentracion:.1f}% en top 10)"
+                        )
+                        vistos.add(direccion)
+                        continue
+
+                    mensaje = formatear_alerta_completa(par, concentracion)
+                    botones = construir_botones(direccion, par.get("url", ""))
+                    enviar_alerta_telegram(mensaje, botones)
+                    vistos.add(direccion)
+                    nuevos_encontrados += 1
+                    log.info(f"Alerta enviada: {par.get('baseToken', {}).get('symbol')}")
+                else:
+                    # lo marcamos como visto igual para no re-evaluarlo cada vez
+                    vistos.add(direccion)
+
+            if nuevos_encontrados > 0:
+                guardar_tokens_vistos(vistos)
+
+            log.info(f"Ciclo completo. {nuevos_encontrados} alertas nuevas enviadas.")
+
+        except Exception as e:
+            log.error(f"Error inesperado en el loop principal: {e}")
+
+        time.sleep(POLL_INTERVAL_SECONDS)
+
+
+if __name__ == "__main__":
+    main()
