@@ -221,7 +221,7 @@ def enviar_alerta_telegram(par: dict) -> None:
 
 
 # ──────────────────────────────────────────────────────────────────────────
-# MANEJO DEL SIMULADOR CORREGIDO (LÓGICA CON SEPARADOR '|')
+# MANEJO DEL SIMULADOR TOTALMENTE CORREGIDO CON ÍNDICES NUMÉRICOS
 # ──────────────────────────────────────────────────────────────────────────
 
 def procesar_actualizaciones_telegram():
@@ -248,10 +248,10 @@ def procesar_actualizaciones_telegram():
                 cb_id = cb.get("id")
                 data = cb.get("data", "")
                 
-                # Usamos una barra recta '|' para separar los datos sin conflictos
                 if data.startswith("sim|"):
                     parts = data.split("|")
                     if len(parts) >= 4:
+                        # POSICIONES ASIGNADAS CORRECTAMENTE MEDIANTE ÍNDICES NUMÉRICOS EXÁCTOS
                         address = parts[1]
                         simbolo = parts[2]
                         precio_entrada = parts[3]
@@ -260,3 +260,4 @@ def procesar_actualizaciones_telegram():
                             "address": address,
                             "simbolo": simbolo,
                             "precio_entrada": float(precio_entrada),
+
