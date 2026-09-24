@@ -20,14 +20,14 @@ CHAT_ID = os.getenv("MEMEBOT_CHAT_ID", "PON_AQUI_TU_CHAT_ID")
 POLL_INTERVAL_SECONDS = 60
 SEEN_TOKENS_FILE = "seen_tokens.json"
 
-FILTROS = {
-    "liquidez_minima_usd": 3_000,       
-    "volumen_24h_minimo_usd": 5_000,    
-    "edad_maxima_horas": 48,            
-    "market_cap_maximo_usd": 10_000_000,
-    "cambio_precio_5m_minimo_pct": 2,   
-    "holders_top10_maximo_pct": 35,     
-}
+   FILTROS = {
+       "liquidez_minima_usd": 10,
+       "volumen_24h_minimo_usd": 10,
+       "edad_maxima_horas": 48,
+       "market_cap_maximo_usd": 100000000,
+       "cambio_precio_5m_minimo_pct": -100,
+       "holders_top10_maximo_pct": 100,
+   }
 
 SOLANA_RPC_URL = "https://solana.com"
 
