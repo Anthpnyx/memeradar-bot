@@ -73,6 +73,19 @@ FILTROS = {
 # qué % del suministro tienen las 10 wallets más grandes de un token
 SOLANA_RPC_URL = "https://api.mainnet-beta.solana.com"
 
+# ──────────────────────────────────────────────────────────────────────────
+# SIMULACIÓN DE COMPRA (paper trading — no usa dinero real)
+# ──────────────────────────────────────────────────────────────────────────
+
+# Cuánto "invierte" el bot de forma simulada en cada token que te avisa
+SIMULACION_MONTO_USD = 50
+
+# Archivo donde guarda las simulaciones abiertas
+SIMULACIONES_FILE = "simulaciones.json"
+
+# A qué horas de vida de la simulación se manda un reporte de progreso
+SIMULACION_CHECKPOINTS_HORAS = [1, 6, 24]
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -239,6 +252,7 @@ def formatear_alerta_completa(par: dict, concentracion_top10=None) -> str:
     volumen = par.get("volume", {}).get("h24", 0)
     market_cap = par.get("fdv") or par.get("marketCap") or 0
     cambio_5m = par.get("priceChange", {}).get("m5", 0)
+    url = par.get("url", "")
 
     if concentracion_top10 is not None:
         linea_holders = f"👥 Top 10 holders: {concentracion_top10:.1f}% del suministro\n"
@@ -256,22 +270,21 @@ def formatear_alerta_completa(par: dict, concentracion_top10=None) -> str:
         f"{linea_holders}"
         f"📄 Contrato:\n"
         f"`{direccion}`\n\n"
-        f"⚠️ Verifica liquidez y holders antes de comprar. Esto es una alerta, no una recomendación."
+        f"⚠️ Verifica liquidez y holders antes de comprar. Esto es una alerta, no una recomendación.\n\n"
+        f"🔗 {url}"
     )
 
 
-def construir_botones(direccion: str, url: str) -> dict:
+def construir_botones(direccion: str) -> dict:
     """
-    Arma el teclado inline con dos botones:
+    Arma el teclado inline con un solo botón:
     - 'Copiar Contrato': usa el botón nativo de copiar texto de Telegram
       (disponible desde Bot API 7.0), copia la dirección con un solo toque.
-    - 'Ver en DexScreener': abre el link directo a la página del token.
     """
     return {
         "inline_keyboard": [
             [
                 {"text": "📋 Copiar Contrato", "copy_text": {"text": direccion}},
-                {"text": "📊 Ver en DexScreener", "url": url},
             ]
         ]
     }
@@ -283,7 +296,7 @@ def enviar_alerta_telegram(mensaje: str, botones: dict = None) -> None:
         "chat_id": CHAT_ID,
         "text": mensaje,
         "parse_mode": "Markdown",
-        "disable_web_page_preview": True,
+        "disable_web_page_preview": False,
     }
     if botones:
         payload["reply_markup"] = botones
@@ -292,6 +305,120 @@ def enviar_alerta_telegram(mensaje: str, botones: dict = None) -> None:
         resp.raise_for_status()
     except requests.RequestException as e:
         log.warning(f"Error enviando mensaje a Telegram: {e}")
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# SIMULACIÓN DE COMPRA — funciones
+# ──────────────────────────────────────────────────────────────────────────
+
+def cargar_simulaciones() -> list:
+    """Carga las simulaciones de compra que siguen abiertas."""
+    if os.path.exists(SIMULACIONES_FILE):
+        with open(SIMULACIONES_FILE, "r") as f:
+            return json.load(f)
+    return []
+
+
+def guardar_simulaciones(simulaciones: list) -> None:
+    with open(SIMULACIONES_FILE, "w") as f:
+        json.dump(simulaciones, f)
+
+
+def crear_simulacion(par: dict) -> dict:
+    """
+    Crea el registro de una 'compra simulada' con el monto configurado,
+    al precio del momento en que el bot mandó la alerta.
+    """
+    direccion = par.get("baseToken", {}).get("address", "?")
+    simbolo = par.get("baseToken", {}).get("symbol", "?")
+    precio_entrada = float(par.get("priceUsd") or 0)
+
+    return {
+        "direccion": direccion,
+        "simbolo": simbolo,
+        "precio_entrada": precio_entrada,
+        "monto_usd": SIMULACION_MONTO_USD,
+        "timestamp_entrada": datetime.now(timezone.utc).timestamp(),
+        "checkpoints_enviados": [],
+    }
+
+
+def obtener_precio_actual(direccion: str):
+    """Trae el precio actual de un token, usando el par con más liquidez."""
+    pares = obtener_pares_de_token(direccion)
+    if not pares:
+        return None
+    mejor_par = max(
+        pares, key=lambda p: float(p.get("liquidity", {}).get("usd") or 0)
+    )
+    precio = mejor_par.get("priceUsd")
+    return float(precio) if precio else None
+
+
+def formatear_reporte_simulacion(sim: dict, precio_actual: float, horas: float, es_final: bool) -> str:
+    """Arma el mensaje de progreso/resultado de una simulación."""
+    precio_entrada = sim["precio_entrada"]
+    monto = sim["monto_usd"]
+    valor_actual = (precio_actual / precio_entrada) * monto if precio_entrada else 0
+    pct = ((valor_actual - monto) / monto) * 100 if monto else 0
+    emoji = "🟢" if pct >= 0 else "🔴"
+    titulo = "🏁 *Resultado final (24h)*" if es_final else "📈 *Actualización de simulación*"
+
+    return (
+        f"{titulo}\n\n"
+        f"*{sim['simbolo']}* — simulación de ${monto} invertidos\n"
+        f"⏱ Tiempo transcurrido: {horas:.1f}h\n"
+        f"💵 Precio entrada: ${precio_entrada}\n"
+        f"💵 Precio actual: ${precio_actual}\n"
+        f"{emoji} Valor actual: ${valor_actual:.2f} ({pct:+.1f}%)\n\n"
+        f"_Esto es solo una simulación, no dinero real._"
+    )
+
+
+def revisar_simulaciones(simulaciones: list) -> bool:
+    """
+    Revisa cada simulación abierta, manda reportes en los checkpoints
+    definidos, y cierra (elimina) las que ya llegaron a las 24h.
+    Devuelve True si hubo cambios que guardar.
+    """
+    cambios = False
+    simulaciones_activas = []
+
+    for sim in simulaciones:
+        ahora = datetime.now(timezone.utc).timestamp()
+        horas_transcurridas = (ahora - sim["timestamp_entrada"]) / 3600
+
+        precio_actual = obtener_precio_actual(sim["direccion"])
+        if precio_actual is None:
+            # no se pudo obtener precio (quizás el pool ya no existe); la dejamos igual
+            simulaciones_activas.append(sim)
+            continue
+
+        checkpoint_a_enviar = None
+        for cp in SIMULACION_CHECKPOINTS_HORAS:
+            if horas_transcurridas >= cp and cp not in sim["checkpoints_enviados"]:
+                checkpoint_a_enviar = cp
+                break
+
+        if checkpoint_a_enviar is not None:
+            es_final = checkpoint_a_enviar == max(SIMULACION_CHECKPOINTS_HORAS)
+            mensaje = formatear_reporte_simulacion(
+                sim, precio_actual, horas_transcurridas, es_final
+            )
+            enviar_alerta_telegram(mensaje)
+            sim["checkpoints_enviados"].append(checkpoint_a_enviar)
+            cambios = True
+            log.info(f"Reporte de simulación enviado: {sim['simbolo']} ({checkpoint_a_enviar}h)")
+
+        # si ya se envió el reporte final (24h), la simulación se cierra
+        if max(SIMULACION_CHECKPOINTS_HORAS) in sim["checkpoints_enviados"]:
+            cambios = True
+            continue  # no se vuelve a agregar a la lista activa
+
+        simulaciones_activas.append(sim)
+
+    simulaciones[:] = simulaciones_activas
+    return cambios
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -310,6 +437,9 @@ def main():
 
     vistos = cargar_tokens_vistos()
     log.info(f"Cargados {len(vistos)} tokens ya vistos previamente.")
+
+    simulaciones = cargar_simulaciones()
+    log.info(f"Cargadas {len(simulaciones)} simulaciones abiertas.")
 
     while True:
         try:
@@ -337,19 +467,28 @@ def main():
                         continue
 
                     mensaje = formatear_alerta_completa(par, concentracion)
-                    botones = construir_botones(direccion, par.get("url", ""))
+                    botones = construir_botones(direccion)
                     enviar_alerta_telegram(mensaje, botones)
                     vistos.add(direccion)
                     nuevos_encontrados += 1
                     log.info(f"Alerta enviada: {par.get('baseToken', {}).get('symbol')}")
+
+                    simulaciones.append(crear_simulacion(par))
                 else:
                     # lo marcamos como visto igual para no re-evaluarlo cada vez
                     vistos.add(direccion)
 
             if nuevos_encontrados > 0:
                 guardar_tokens_vistos(vistos)
+                guardar_simulaciones(simulaciones)
 
-            log.info(f"Ciclo completo. {nuevos_encontrados} alertas nuevas enviadas.")
+            if revisar_simulaciones(simulaciones):
+                guardar_simulaciones(simulaciones)
+
+            log.info(
+                f"Ciclo completo. {nuevos_encontrados} alertas nuevas enviadas. "
+                f"{len(simulaciones)} simulaciones abiertas."
+            )
 
         except Exception as e:
             log.error(f"Error inesperado en el loop principal: {e}")
