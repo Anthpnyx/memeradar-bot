@@ -67,6 +67,7 @@ FILTROS = {
     "market_cap_maximo_usd": 10_000_000,# evita tokens que ya "explotaron" y subir es más difícil
     "cambio_precio_5m_minimo_pct": 2,   # solo sube (no baja): mínimo % de subida en 5 min
     "holders_top10_maximo_pct": 35,     # rechaza tokens muy concentrados (riesgo de manipulación/rug)
+    "requerir_mint_freeze_revocados": True,  # exige que el creador ya no pueda crear más tokens ni congelar wallets
 }
 
 # RPC público de Solana (oficial, gratis, sin API key) — usado para calcular
@@ -84,7 +85,7 @@ SIMULACION_MONTO_USD = 50
 SIMULACIONES_FILE = "simulaciones.json"
 
 # A qué horas de vida de la simulación se manda un reporte de progreso
-SIMULACION_CHECKPOINTS_HORAS = [1, 6, 24]
+SIMULACION_CHECKPOINTS_HORAS = [1]
 
 logging.basicConfig(
     level=logging.INFO,
@@ -210,6 +211,172 @@ def obtener_concentracion_top10(direccion_token: str):
         return None
 
 
+def obtener_seguridad_mint(direccion_token: str) -> dict:
+    """
+    Consulta si el creador del token todavía tiene 'mint authority' (poder
+    para crear más tokens de la nada) o 'freeze authority' (poder para
+    congelar wallets de otros holders). Usa el RPC oficial de Solana.
+
+    Devuelve {"mint_revocado": bool|None, "freeze_revocado": bool|None}.
+    True = revocado (más seguro). None = no se pudo determinar.
+    """
+    resultado = {"mint_revocado": None, "freeze_revocado": None}
+    try:
+        resp = requests.post(
+            SOLANA_RPC_URL,
+            json={
+                "jsonrpc": "2.0", "id": 1,
+                "method": "getAccountInfo",
+                "params": [direccion_token, {"encoding": "jsonParsed"}],
+            },
+            timeout=10,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        info = (
+            data.get("result", {})
+            .get("value", {})
+            .get("data", {})
+            .get("parsed", {})
+            .get("info", {})
+        )
+        if info:
+            resultado["mint_revocado"] = info.get("mintAuthority") is None
+            resultado["freeze_revocado"] = info.get("freezeAuthority") is None
+    except (requests.RequestException, TypeError, ValueError, KeyError) as e:
+        log.warning(f"No se pudo verificar mint/freeze authority para {direccion_token}: {e}")
+
+    return resultado
+
+
+def obtener_porcentaje_creador(direccion_token: str):
+    """
+    Aproxima qué % del suministro tiene la wallet 'creadora' del token.
+
+    Solana no guarda un campo oficial de 'creador' en el token en sí, así que
+    esto es una aproximación: busca la primera transacción registrada del
+    token y asume que quien la firmó es el creador. Para tokens muy activos
+    o con historial largo, esta aproximación puede no ser exacta (el RPC
+    público solo trae hasta 1000 transacciones por consulta).
+
+    Devuelve un float (porcentaje) o None si no se pudo determinar.
+    """
+    try:
+        # 1) Traer transacciones del token (más recientes primero, máx 1000)
+        resp_sigs = requests.post(
+            SOLANA_RPC_URL,
+            json={
+                "jsonrpc": "2.0", "id": 1,
+                "method": "getSignaturesForAddress",
+                "params": [direccion_token, {"limit": 1000}],
+            },
+            timeout=10,
+        )
+        resp_sigs.raise_for_status()
+        firmas = resp_sigs.json().get("result", []) or []
+        if not firmas:
+            return None
+
+        # La más antigua dentro de lo que trajo el RPC (aproximación)
+        firma_mas_antigua = firmas[-1]["signature"]
+
+        # 2) Ver quién pagó/firmó esa transacción (probablemente el creador)
+        resp_tx = requests.post(
+            SOLANA_RPC_URL,
+            json={
+                "jsonrpc": "2.0", "id": 1,
+                "method": "getTransaction",
+                "params": [
+                    firma_mas_antigua,
+                    {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0},
+                ],
+            },
+            timeout=10,
+        )
+        resp_tx.raise_for_status()
+        tx_data = resp_tx.json().get("result", {}) or {}
+        cuentas = (
+            tx_data.get("transaction", {}).get("message", {}).get("accountKeys", [])
+        )
+        if not cuentas:
+            return None
+        wallet_creador = cuentas[0].get("pubkey")  # primera cuenta = quien paga/firma
+        if not wallet_creador:
+            return None
+
+        # 3) Cuánto tiene esa wallet del token ahora, y el suministro total
+        resp_balance = requests.post(
+            SOLANA_RPC_URL,
+            json={
+                "jsonrpc": "2.0", "id": 1,
+                "method": "getTokenAccountsByOwner",
+                "params": [
+                    wallet_creador,
+                    {"mint": direccion_token},
+                    {"encoding": "jsonParsed"},
+                ],
+            },
+            timeout=10,
+        )
+        resp_balance.raise_for_status()
+        cuentas_token = resp_balance.json().get("result", {}).get("value", []) or []
+        balance_creador = sum(
+            float(
+                c.get("account", {})
+                .get("data", {})
+                .get("parsed", {})
+                .get("info", {})
+                .get("tokenAmount", {})
+                .get("uiAmount") or 0
+            )
+            for c in cuentas_token
+        )
+
+        resp_supply = requests.post(
+            SOLANA_RPC_URL,
+            json={
+                "jsonrpc": "2.0", "id": 1,
+                "method": "getTokenSupply",
+                "params": [direccion_token],
+            },
+            timeout=10,
+        )
+        resp_supply.raise_for_status()
+        total_supply = float(
+            resp_supply.json().get("result", {}).get("value", {}).get("uiAmount") or 0
+        )
+        if total_supply <= 0:
+            return None
+
+        return (balance_creador / total_supply) * 100
+    except (requests.RequestException, TypeError, ValueError, KeyError, IndexError) as e:
+        log.warning(f"No se pudo aproximar % del creador para {direccion_token}: {e}")
+        return None
+
+
+def estimar_eventos_por_minuto(par: dict) -> float:
+    """
+    Aproxima 'eventos por minuto' usando las transacciones (compras+ventas)
+    de la última hora, dividido entre 60.
+    """
+    txns_h1 = par.get("txns", {}).get("h1", {}) or {}
+    total_h1 = (txns_h1.get("buys") or 0) + (txns_h1.get("sells") or 0)
+    return total_h1 / 60
+
+
+def formatear_edad(horas: float) -> str:
+    """Convierte horas a un texto legible: segundos, minutos, horas o días."""
+    segundos = horas * 3600
+    if segundos < 60:
+        return f"{segundos:.0f}s"
+    minutos = segundos / 60
+    if minutos < 60:
+        return f"{minutos:.0f}m"
+    if horas < 24:
+        return f"{horas:.1f}h"
+    return f"{horas / 24:.1f}d"
+
+
 def cumple_filtros(par: dict) -> bool:
     """Aplica los criterios definidos en FILTROS a un par de DexScreener."""
     try:
@@ -242,7 +409,12 @@ def cumple_filtros(par: dict) -> bool:
         return False
 
 
-def formatear_alerta_completa(par: dict, concentracion_top10=None) -> str:
+def formatear_alerta_completa(
+    par: dict,
+    concentracion_top10=None,
+    seguridad: dict = None,
+    porcentaje_creador=None,
+) -> str:
     """Arma el texto del mensaje de Telegram con toda la info clave del token."""
     nombre = par.get("baseToken", {}).get("name", "?")
     simbolo = par.get("baseToken", {}).get("symbol", "?")
@@ -254,10 +426,44 @@ def formatear_alerta_completa(par: dict, concentracion_top10=None) -> str:
     cambio_5m = par.get("priceChange", {}).get("m5", 0)
     url = par.get("url", "")
 
+    creado_ts = par.get("pairCreatedAt")
+    if creado_ts:
+        edad_horas = (datetime.now(timezone.utc).timestamp() - (creado_ts / 1000)) / 3600
+        linea_edad = f"⏱ Edad: {formatear_edad(edad_horas)}\n"
+    else:
+        linea_edad = ""
+
+    txns_24h = par.get("txns", {}).get("h24", {}) or {}
+    compras = txns_24h.get("buys")
+    ventas = txns_24h.get("sells")
+    if compras is not None and ventas is not None:
+        linea_txns = f"👥 Compras 24h: {compras} · Ventas 24h: {ventas}\n"
+    else:
+        linea_txns = ""
+
     if concentracion_top10 is not None:
-        linea_holders = f"👥 Top 10 holders: {concentracion_top10:.1f}% del suministro\n"
+        linea_holders = f"🏦 Top 10 holders: {concentracion_top10:.1f}% del suministro\n"
     else:
         linea_holders = ""
+
+    if porcentaje_creador is not None:
+        linea_creador = f"👤 Creador: {porcentaje_creador:.1f}% del suministro\n"
+    else:
+        linea_creador = ""
+
+    ev_min = estimar_eventos_por_minuto(par)
+    linea_ev_min = f"📊 {ev_min:.1f} eventos/min (última hora)\n"
+
+    if seguridad:
+        mint_ok = seguridad.get("mint_revocado")
+        freeze_ok = seguridad.get("freeze_revocado")
+        mint_txt = "✅" if mint_ok else ("❌" if mint_ok is False else "❓")
+        freeze_txt = "✅" if freeze_ok else ("❌" if freeze_ok is False else "❓")
+        linea_seguridad = (
+            f"🛡 Seguridad: mint {mint_txt} · freeze {freeze_txt}\n"
+        )
+    else:
+        linea_seguridad = ""
 
     return (
         "🚨 *Token nuevo detectado*\n\n"
@@ -267,12 +473,18 @@ def formatear_alerta_completa(par: dict, concentracion_top10=None) -> str:
         f"💧 Liquidez: ${float(liquidez):,.0f}\n"
         f"📈 Volumen 24h: ${float(volumen):,.0f}\n"
         f"⚡ Cambio 5min: {cambio_5m}%\n"
+        f"{linea_edad}"
+        f"{linea_ev_min}"
+        f"{linea_txns}"
         f"{linea_holders}"
+        f"{linea_creador}"
+        f"{linea_seguridad}"
         f"📄 Contrato:\n"
         f"`{direccion}`\n\n"
         f"⚠️ Verifica liquidez y holders antes de comprar. Esto es una alerta, no una recomendación.\n\n"
         f"🔗 {url}"
     )
+
 
 
 def construir_botones(direccion: str) -> dict:
@@ -362,7 +574,7 @@ def formatear_reporte_simulacion(sim: dict, precio_actual: float, horas: float, 
     valor_actual = (precio_actual / precio_entrada) * monto if precio_entrada else 0
     pct = ((valor_actual - monto) / monto) * 100 if monto else 0
     emoji = "🟢" if pct >= 0 else "🔴"
-    titulo = "🏁 *Resultado final (24h)*" if es_final else "📈 *Actualización de simulación*"
+    titulo = "🏁 *Resultado final (1h)*" if es_final else "📈 *Actualización de simulación*"
 
     return (
         f"{titulo}\n\n"
@@ -466,7 +678,22 @@ def main():
                         vistos.add(direccion)
                         continue
 
-                    mensaje = formatear_alerta_completa(par, concentracion)
+                    seguridad = obtener_seguridad_mint(direccion)
+                    if FILTROS["requerir_mint_freeze_revocados"] and (
+                        seguridad.get("mint_revocado") is False
+                        or seguridad.get("freeze_revocado") is False
+                    ):
+                        log.info(
+                            f"Descartado por mint/freeze authority activa: "
+                            f"{par.get('baseToken', {}).get('symbol')}"
+                        )
+                        vistos.add(direccion)
+                        continue
+
+                    porcentaje_creador = obtener_porcentaje_creador(direccion)
+                    mensaje = formatear_alerta_completa(
+                        par, concentracion, seguridad, porcentaje_creador
+                    )
                     botones = construir_botones(direccion)
                     enviar_alerta_telegram(mensaje, botones)
                     vistos.add(direccion)
